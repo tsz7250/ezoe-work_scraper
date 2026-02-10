@@ -62,22 +62,79 @@ def convert_quotes(text):
             result.append(char)
     return ''.join(result)
 
-def extract_book_name(soup):
+def extract_book_name(soup, url=None):
     """
     從網頁中提取書名
     從 <a class="brandtitle header__link"> 元素中提取
+    對於三級結構（X-Y-Z.html），會嘗試從書籍首頁（X.html）獲取真正的書名
     """
     brandtitle = soup.find('a', class_='brandtitle')
     if brandtitle:
-        return brandtitle.get_text(strip=True)
+        book_name = brandtitle.get_text(strip=True)
+        
+        # 檢測是否為三級結構（brandtitle 包含卷/冊等關鍵字）
+        if url and re.search(r'(卷[一二三四五六七八九十百]+|第\d+[册冊]|第[一二三四五六七八九十]+[册冊])', book_name):
+            # 嘗試從 URL 提取書號並獲取書籍首頁的書名
+            match = re.search(r'/books/\d+/(\d+)-\d+-\d+\.html', url)
+            if match:
+                book_id = match.group(1)
+                book_base_url = re.sub(r'/(\d+)-\d+-\d+\.html', f'/{book_id}.html', url)
+                try:
+                    response = requests.get(book_base_url)
+                    response.encoding = 'utf-8'
+                    base_soup = BeautifulSoup(response.text, 'html.parser')
+                    base_brandtitle = base_soup.find('a', class_='brandtitle')
+                    if base_brandtitle:
+                        book_name = base_brandtitle.get_text(strip=True)
+                except:
+                    # 如果獲取失敗，移除卷/冊等前綴
+                    book_name = re.sub(r'^(卷[一二三四五六七八九十百]+|第\d+[册冊]|第[一二三四五六七八九十]+[册冊])\s+', '', book_name)
+        
+        return book_name
+    return None
+
+def extract_volume_name(soup):
+    """
+    從網頁中提取卷名（用於三級結構）
+    從 <a class="brandtitle"> 元素中提取，只有當包含卷/冊關鍵字時才返回
+    """
+    brandtitle = soup.find('a', class_='brandtitle')
+    if brandtitle:
+        volume_name = brandtitle.get_text(strip=True)
+        # 如果包含卷/冊關鍵字，這就是卷名
+        if re.search(r'(卷[一二三四五六七八九十百]+|第\d+[册冊]|第[一二三四五六七八九十]+[册冊])', volume_name):
+            return volume_name
+    return None
+
+def extract_chapter_number(url):
+    """
+    從 URL 提取章號（只取最後一個數字）
+    例如：從 "https://ezoe.work/books/2/2022-1-1.html" 提取 "1"（只要章號）
+    例如：從 "https://ezoe.work/books/1/1046-1.html" 提取 "1"
+    """
+    # 三級結構：2022-1-1.html → "1"（返回第二個數字，即章號）
+    match = re.search(r'-(\d+)-(\d+)\.html', url)
+    if match:
+        return match.group(2)  # 返回章號
+    
+    # 兩級結構：1046-1.html → "1"
+    match = re.search(r'-(\d+)\.html', url)
+    if match:
+        return match.group(1)
     return None
 
 def extract_article_number_from_url(url):
     """
-    從 URL 中提取篇數
+    從 URL 中提取篇數（保留用於向後兼容）
     例如：從 "https://ezoe.work/books/3/3061-11.html" 提取 "11"
+    例如：從 "https://ezoe.work/books/2/2022-1-1.html" 提取 "1-1"（三級結構）
     """
-    # 匹配 URL 中最後的數字（在 .html 之前）
+    # 先嘗試匹配三級結構（X-Y-Z.html）
+    match = re.search(r'-(\d+)-(\d+)\.html', url)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    
+    # 再匹配兩級結構（X-Y.html）
     match = re.search(r'-(\d+)\.html', url)
     if match:
         return match.group(1)
@@ -95,17 +152,20 @@ def scrape_to_markdown(url, output_file=None):
     
     # 如果沒有指定輸出檔案名，自動生成
     if output_file is None:
-        book_name = extract_book_name(soup)
-        # 從 URL 中提取篇數
-        article_num = extract_article_number_from_url(url)
+        book_name = extract_book_name(soup, url)
+        volume_name = extract_volume_name(soup)
+        chapter_num = extract_chapter_number(url)
         
-        # 根據書名和篇數生成檔案名
-        if book_name and article_num:
-            output_file = f"{book_name}_{article_num}.md"
+        # 三級結構：書名_卷名_章號.md
+        if book_name and volume_name and chapter_num:
+            output_file = f"{book_name}_{volume_name}_{chapter_num}.md"
+        # 兩級結構：書名_章號.md
+        elif book_name and chapter_num:
+            output_file = f"{book_name}_{chapter_num}.md"
         elif book_name:
             output_file = f"{book_name}.md"
-        elif article_num:
-            output_file = f"第{article_num}篇.md"
+        elif chapter_num:
+            output_file = f"第{chapter_num}篇.md"
         else:
             output_file = "output.md"
     
@@ -119,10 +179,30 @@ def scrape_to_markdown(url, output_file=None):
             title_text = title.get_text(strip=True)
             markdown_lines.append(f"# {title_text}\n")
     
-    # 2. 提取主要內容區域
-    main = soup.find('div', class_='main')
+    # 2. 提取主要內容區域（使用多層級備用選擇器）
+    main = None
+    selectors = [
+        ('div', {'class': 'main'}),
+        ('div', {'class': 'content'}),
+        ('div', {'class': 'container'}),
+        ('article', {}),
+        ('main', {}),
+        ('body', {})  # 最後備用方案
+    ]
+    
+    for tag_name, attrs in selectors:
+        main = soup.find(tag_name, attrs) if attrs else soup.find(tag_name)
+        if main:
+            selector_desc = f"<{tag_name} class='{attrs.get('class')}'>" if attrs.get('class') else f"<{tag_name}>"
+            if tag_name != 'div' or attrs.get('class') != 'main':
+                print(f"資訊：使用備用選擇器 {selector_desc}")
+            break
+    
     if not main:
         print("警告：找不到主要內容區域")
+        print("除錯資訊：網頁的前幾層標籤：")
+        for tag in soup.find_all(limit=10):
+            print(f"  <{tag.name}> class={tag.get('class')}, id={tag.get('id')}")
         return
     
     # 遍歷主要內容區域的所有直接子元素

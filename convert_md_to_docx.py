@@ -29,41 +29,143 @@ def get_article_number(filename):
     return 0
 
 def extract_book_name(filename):
-    """從檔案名提取書名（去除 _數字.md 後綴）"""
-    match = re.search(r'^(.+?)_\d+\.md$', filename)
-    if match:
-        return match.group(1)
-    return None
+    """從檔案名提取書名（只取第一個底線前的部分）
+    範例：
+        - 属灵人_卷一 灵魂体的总论_1.md → "属灵人"
+        - 神经纶的福音_1.md → "神经纶的福音"
+    """
+    # 移除 .md 後綴
+    name = filename.replace('.md', '')
+    
+    # 只提取第一個底線前的內容作為書名
+    if '_' in name:
+        return name.split('_')[0]
+    
+    return name
+
+def extract_book_and_volume_name(filename):
+    """從檔案名提取書名和卷名的組合（用於分組）
+    範例：
+        - 属灵人_卷一 灵魂体的总论_1.md → "属灵人_卷一 灵魂体的总论"
+        - 神经纶的福音_1.md → "神经纶的福音"
+    """
+    # 移除 .md 後綴
+    name = filename.replace('.md', '')
+    
+    # 分割檔案名
+    parts = name.split('_')
+    
+    if len(parts) >= 3:
+        # 三級結構：返回「書名_卷名」
+        return f"{parts[0]}_{parts[1]}"
+    elif len(parts) == 2:
+        # 兩級結構：返回書名
+        return parts[0]
+    else:
+        return name
+
+def chinese_to_number(chinese_str):
+    """將中文數字轉換為阿拉伯數字"""
+    mapping = {
+        '一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
+        '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
+        '百': 100
+    }
+    
+    # 處理簡單情況
+    if chinese_str in mapping:
+        return mapping[chinese_str]
+    
+    # 處理十位數（如「十一」、「二十」等）
+    result = 0
+    temp = 0
+    for char in chinese_str:
+        if char in mapping:
+            if mapping[char] >= 10:
+                if temp == 0:
+                    temp = 1
+                result += temp * mapping[char]
+                temp = 0
+            else:
+                temp = mapping[char]
+        else:
+            if temp > 0:
+                result += temp
+                temp = 0
+    
+    if temp > 0:
+        result += temp
+    
+    return result if result > 0 else 0
+
+def extract_sort_key(filename):
+    """提取排序鍵，確保正確排序
+    範例：
+        - 属灵人_卷一 灵魂体的总论_1.md → (1, 1)
+        - 属灵人_卷一 灵魂体的总论_2.md → (1, 2)
+        - 属灵人_卷二 肉体_1.md → (2, 1)
+        - 神经纶的福音_1.md → (0, 1)
+    """
+    name = filename.replace('.md', '')
+    parts = name.split('_')
+    
+    if len(parts) >= 3:
+        # 三級結構：提取卷號和章號
+        volume_text = parts[1]
+        chapter_num = int(parts[2]) if parts[2].isdigit() else 0
+        
+        # 嘗試從卷名中提取數字
+        volume_match = re.search(r'卷([一二三四五六七八九十百]+)|第(\d+)[册冊]|第([一二三四五六七八九十]+)[册冊]', volume_text)
+        
+        if volume_match:
+            if volume_match.group(1):  # 中文數字
+                volume_num = chinese_to_number(volume_match.group(1))
+            elif volume_match.group(2):  # 阿拉伯數字
+                volume_num = int(volume_match.group(2))
+            elif volume_match.group(3):  # 中文數字（冊）
+                volume_num = chinese_to_number(volume_match.group(3))
+            else:
+                volume_num = 0
+            return (volume_num, chapter_num)
+        else:
+            return (0, chapter_num)
+    
+    elif len(parts) == 2:
+        # 兩級結構：只有章號
+        chapter_num = int(parts[1]) if parts[1].isdigit() else 0
+        return (0, chapter_num)
+    
+    return (0, 0)
 
 def collect_markdown_files_by_book():
-    """收集所有 Markdown 檔案並按書名分組"""
+    """收集所有 Markdown 檔案並按書名和卷名分組（一卷一個 docx）"""
     # 找出所有 *_數字.md 格式的檔案
     all_files = glob.glob("*_*.md")
     
-    # 過濾出符合 書名_數字.md 格式的檔案
+    # 過濾出符合格式的檔案（書名_數字.md 或 書名_卷名_數字.md）
     valid_files = [f for f in all_files if re.match(r'^.+_\d+\.md$', f)]
     
     if not valid_files:
         return {}
     
-    # 按書名分組
+    # 按「書名_卷名」分組並排序
     books = {}
     for file in valid_files:
-        book_name = extract_book_name(file)
-        if book_name:
-            if book_name not in books:
-                books[book_name] = []
-            books[book_name].append(file)
+        book_and_volume = extract_book_and_volume_name(file)
+        if book_and_volume:
+            if book_and_volume not in books:
+                books[book_and_volume] = []
+            books[book_and_volume].append(file)
     
-    # 每本書的檔案按編號排序
-    for book_name in books:
-        books[book_name].sort(key=get_article_number)
+    # 每個分組的檔案按排序鍵排序（支援三級結構）
+    for book_and_volume in books:
+        books[book_and_volume].sort(key=extract_sort_key)
     
     return books
 
 def process_markdown_headings(content, article_num):
     """處理 Markdown 標題：
-    將連續的一級標題合併為一個「第X篇 XXXX」格式的標題
+    將連續的一級標題合併為一個標題
     保留其他級別標題的原有格式（保持視覺差異）
     """
     lines = content.split('\n')
@@ -94,55 +196,13 @@ def process_markdown_headings(content, article_num):
                     # 遇到非空行且非一級標題，停止收集
                     break
             
-            # 處理收集到的一級標題
-            if len(h1_titles) == 0:
+            # 處理收集到的一級標題：簡單合併所有標題
+            if h1_titles:
+                merged_title = ' '.join(h1_titles)
+                processed_lines.append(f"# {merged_title}")
+            else:
                 # 不應該發生，但安全處理
                 processed_lines.append(line)
-                i += 1
-            elif len(h1_titles) == 1:
-                # 只有一個標題
-                title_text = h1_titles[0]
-                # 檢查是否已經包含「第X篇」格式（中文數字或阿拉伯數字）
-                if re.match(r'^第[一二三四五六七八九十百千萬〇\d]+篇\s+.+', title_text):
-                    # 已經包含「第X篇 標題」，直接使用（保留原本的中文數字）
-                    processed_lines.append(f"# {title_text}")
-                elif re.match(r'^第[一二三四五六七八九十百千萬〇\d]+篇$', title_text):
-                    # 只有「第X篇」，沒有標題內容，直接使用（保留原本的中文數字）
-                    processed_lines.append(f"# {title_text}")
-                else:
-                    # 不包含篇數，添加篇數（使用檔案編號轉換為中文數字，但這裡先簡單處理）
-                    # 如果沒有篇數，使用檔案編號
-                    processed_lines.append(f"# 第{article_num}篇 {title_text}")
-            else:
-                # 多個標題，合併處理
-                # 第一個標題通常是篇數（如「第四〇四篇」或「第一篇」），後續是標題內容
-                first_title = h1_titles[0]
-                other_titles = ' '.join(h1_titles[1:]) if len(h1_titles) > 1 else ''
-                
-                # 提取第一個標題中的篇數部分（保留中文數字）
-                article_match = re.match(r'^(第[一二三四五六七八九十百千萬〇\d]+篇)', first_title)
-                if article_match:
-                    # 找到篇數部分，保留原本的中文數字格式
-                    article_part = article_match.group(1)
-                    # 檢查第一個標題是否只包含篇數（沒有其他內容）
-                    if re.match(r'^第[一二三四五六七八九十百千萬〇\d]+篇$', first_title):
-                        # 第一個標題只包含篇數，使用這個篇數，加上後續標題
-                        if other_titles:
-                            processed_lines.append(f"# {article_part} {other_titles}")
-                        else:
-                            processed_lines.append(f"# {article_part}")
-                    else:
-                        # 第一個標題包含篇數和內容，提取內容並與後續標題合併
-                        first_content = re.sub(r'^第[一二三四五六七八九十百千萬〇\d]+篇\s+', '', first_title)
-                        all_content = ' '.join([first_content] + h1_titles[1:]) if first_content else other_titles
-                        if all_content:
-                            processed_lines.append(f"# {article_part} {all_content}")
-                        else:
-                            processed_lines.append(f"# {article_part}")
-                else:
-                    # 第一個標題不包含篇數，合併所有標題並添加篇數（使用檔案編號）
-                    all_titles = ' '.join(h1_titles)
-                    processed_lines.append(f"# 第{article_num}篇 {all_titles}")
             
             # 跳過已處理的行（包括空行）
             i = j
@@ -154,7 +214,7 @@ def process_markdown_headings(content, article_num):
     return '\n'.join(processed_lines)
 
 def merge_markdown_files(files):
-    """合併所有 Markdown 檔案內容，每篇之間添加分頁符號"""
+    """合併所有 Markdown 檔案內容"""
     merged_content = []
     
     for i, file in enumerate(files):
@@ -164,22 +224,19 @@ def merge_markdown_files(files):
             with open(file, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
                 
-                # 將波浪號轉義，避免被 pandoc 誤解為下標標記
-                # 在 Markdown 中，~text~ 會被轉換為下標
-                # 使用反斜線轉義波浪號：\~
+                # 將波浪號轉義
                 content = content.replace('~', r'\~')
                 
                 # 獲取文章編號
                 article_num = get_article_number(file)
                 
-                # 處理標題：只保留一級標題作為標題，其他轉為普通段落
+                # 處理標題
                 content = process_markdown_headings(content, article_num)
                 
                 merged_content.append(content)
                 
                 # 在每篇文章之間添加分頁符號（除了最後一篇）
                 if i < len(files) - 1:
-                    # 使用 pandoc 的原始 OpenXML 區塊插入 Word 分頁符
                     merged_content.append('\n\n```{=openxml}\n<w:p><w:r><w:br w:type="page"/></w:r></w:p>\n```\n\n')
         
         except Exception as e:
@@ -379,56 +436,169 @@ def convert_string_simplified_to_traditional(text):
     使用 Word COM 將字串由簡體轉為繁體。
     需在 Windows 上執行且已安裝 Microsoft Word。
     回傳轉換後的字串；若失敗則回傳原字串。
+    增強版：包含重試機制、延遲和完善的資源清理。
     """
     if sys.platform != 'win32':
         return text
-    try:
-        import win32com.client
-        app = win32com.client.Dispatch('Word.Application')
-        app.Visible = False
-        doc = app.Documents.Add()
-        doc.Content.Text = text
-        doc.Content.TCSCConverter(WD_TCSC_CONVERTER_DIRECTION_SCTC, True, True)
-        result = doc.Content.Text.strip()
-        doc.Close(SaveChanges=False)
-        app.Quit()
-        return result
-    except Exception as e:
-        print(f"警告：字串簡轉繁失敗: {e}")
-        return text
+    
+    import time
+    
+    # 重試最多 3 次
+    for attempt in range(3):
+        app = None
+        doc = None
+        try:
+            import pythoncom
+            import win32com.client
+            
+            # 初始化 COM
+            pythoncom.CoInitialize()
+            
+            # 創建 Word 應用程序
+            app = win32com.client.Dispatch('Word.Application')
+            app.Visible = False
+            app.DisplayAlerts = 0  # 禁用所有警告彈窗
+            
+            # 創建新文檔
+            doc = app.Documents.Add()
+            doc.Content.Text = text
+            
+            # 執行簡轉繁
+            doc.Content.TCSCConverter(WD_TCSC_CONVERTER_DIRECTION_SCTC, True, True)
+            result = doc.Content.Text.strip()
+            
+            # 關閉文檔（不保存）
+            doc.Close(SaveChanges=False)
+            doc = None
+            
+            # 關閉 Word
+            app.Quit()
+            app = None
+            
+            # 清理 COM
+            pythoncom.CoUninitialize()
+            
+            return result
+            
+        except Exception as e:
+            print(f"警告：字串簡轉繁失敗 (嘗試 {attempt + 1}/3): {e}")
+            
+            # 清理資源
+            try:
+                if doc is not None:
+                    doc.Close(SaveChanges=False)
+            except:
+                pass
+            
+            try:
+                if app is not None:
+                    app.Quit()
+            except:
+                pass
+            
+            try:
+                pythoncom.CoUninitialize()
+            except:
+                pass
+            
+            # 如果不是最後一次嘗試，等待 1.5 秒後重試
+            if attempt < 2:
+                time.sleep(1.5)
+            else:
+                # 最後一次嘗試失敗，返回原字串
+                return text
+    
+    return text
 
 def convert_docx_simplified_to_traditional(docx_path):
     """
     使用 Word COM 將 DOCX 整份內容由簡體轉為繁體並存檔。
     需在 Windows 上執行且已安裝 Microsoft Word。
     回傳 True 成功，False 失敗。
+    增強版：包含重試機制、延遲和完善的資源清理。
     """
     if sys.platform != 'win32':
         print("警告：簡轉繁需在 Windows 上使用 Word COM，已略過")
         return False
-    try:
-        import win32com.client
-        abs_path = os.path.abspath(docx_path)
-        if not os.path.isfile(abs_path):
-            print(f"警告：找不到檔案 {abs_path}")
-            return False
-        app = win32com.client.Dispatch('Word.Application')
-        app.Visible = False
-        # 使用完整路徑開啟，避免中文路徑問題
-        doc = app.Documents.Open(FileName=abs_path, ConfirmConversions=False, ReadOnly=False)
-        doc.Activate()
-        # 選取整份文件後再轉換（與 Word 手動「簡體轉繁體」行為一致）
-        app.Selection.WholeStory()
-        app.Selection.Range.TCSCConverter(WD_TCSC_CONVERTER_DIRECTION_SCTC, True, True)
-        doc.Save()
-        doc.Close(SaveChanges=True)
-        app.Quit()
-        print("已使用 Word 將整份文件轉為繁體並存檔")
-        return True
-    except Exception as e:
-        print(f"\n警告：Word 簡轉繁時發生錯誤: {e}")
-        traceback.print_exc()
+    
+    import time
+    
+    abs_path = os.path.abspath(docx_path)
+    if not os.path.isfile(abs_path):
+        print(f"警告：找不到檔案 {abs_path}")
         return False
+    
+    # 重試最多 3 次
+    for attempt in range(3):
+        app = None
+        doc = None
+        try:
+            import pythoncom
+            import win32com.client
+            
+            # 初始化 COM
+            pythoncom.CoInitialize()
+            
+            # 創建 Word 應用程序
+            app = win32com.client.Dispatch('Word.Application')
+            app.Visible = False
+            app.DisplayAlerts = 0  # 禁用所有警告彈窗
+            
+            # 開啟文檔
+            doc = app.Documents.Open(FileName=abs_path, ConfirmConversions=False, ReadOnly=False)
+            doc.Activate()
+            
+            # 選取整份文件後再轉換
+            app.Selection.WholeStory()
+            app.Selection.Range.TCSCConverter(WD_TCSC_CONVERTER_DIRECTION_SCTC, True, True)
+            
+            # 保存並關閉
+            doc.Save()
+            doc.Close(SaveChanges=True)
+            doc = None
+            
+            # 關閉 Word
+            app.Quit()
+            app = None
+            
+            # 清理 COM
+            pythoncom.CoUninitialize()
+            
+            print("已使用 Word 將整份文件轉為繁體並存檔")
+            return True
+            
+        except Exception as e:
+            print(f"\n警告：Word 簡轉繁時發生錯誤 (嘗試 {attempt + 1}/3): {e}")
+            if attempt < 2:
+                print(f"將在 1.5 秒後重試...")
+            
+            # 清理資源
+            try:
+                if doc is not None:
+                    doc.Close(SaveChanges=False)
+            except:
+                pass
+            
+            try:
+                if app is not None:
+                    app.Quit()
+            except:
+                pass
+            
+            try:
+                pythoncom.CoUninitialize()
+            except:
+                pass
+            
+            # 如果不是最後一次嘗試，等待 1.5 秒後重試
+            if attempt < 2:
+                time.sleep(1.5)
+            else:
+                # 最後一次嘗試失敗
+                traceback.print_exc()
+                return False
+    
+    return False
 
 def main():
     """主程式"""
@@ -473,7 +643,7 @@ def main():
         
         # 轉換為 DOCX
         print(f"步驟 3: 轉換為 DOCX 格式...")
-        output_file = f"{book_name}.docx"
+        output_file = f"{book_name.replace('_', ' ')}.docx"
         
         if convert_to_docx(merged_content, output_file):
             # 使用 Word COM 將 DOCX 簡體轉繁體並存檔
@@ -484,7 +654,7 @@ def main():
             print(f"步驟 5: 將檔案名稱轉為繁體...")
             traditional_book_name = convert_string_simplified_to_traditional(book_name)
             if traditional_book_name != book_name:
-                new_output_file = f"{traditional_book_name}.docx"
+                new_output_file = f"{traditional_book_name.replace('_', ' ')}.docx"
                 try:
                     if os.path.exists(new_output_file):
                         os.remove(new_output_file)
