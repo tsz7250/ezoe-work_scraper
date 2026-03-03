@@ -403,8 +403,8 @@ def convert_to_docx(markdown_content, output_file):
         # 設定行距為 1.5
         set_line_spacing(output_file, 1.5)
         
-        # 處理標題樣式：只保留一級標題作為標題樣式
-        process_docx_headings(output_file)
+        # 處理標題樣式：註解掉此行以保留所有級別的標題作為 PDF 書籤
+        # process_docx_headings(output_file)
         
         return True
         
@@ -413,15 +413,43 @@ def convert_to_docx(markdown_content, output_file):
         return False
 
 def convert_docx_to_pdf(docx_file):
-    """將 DOCX 檔案轉換為 PDF"""
+    """將 DOCX 檔案轉換為 PDF，並確保產生書籤(目錄)"""
     try:
-        pdf_file = docx_file.replace('.docx', '.pdf')
-        print(f"\n開始轉換為 PDF 格式：{pdf_file}")
+        import win32com.client
+        import pythoncom
         
-        # 執行轉換
-        docx2pdf_convert(docx_file, pdf_file)
+        abs_docx = os.path.abspath(docx_file)
+        pdf_file = abs_docx.replace('.docx', '.pdf')
+        print(f"\n開始轉換為 PDF 格式：{os.path.basename(pdf_file)}")
         
-        print(f"成功生成 PDF 檔案：{pdf_file}")
+        # 初始化 COM
+        pythoncom.CoInitialize()
+        
+        # 啟動 Word
+        word = win32com.client.Dispatch('Word.Application')
+        word.Visible = False
+        word.DisplayAlerts = 0
+        
+        # 開啟文檔
+        doc = word.Documents.Open(abs_docx, ReadOnly=True)
+        
+        # 參數定義 (來自 Word VBA)
+        # WdExportFormat 17 = wdExportFormatPDF
+        # WdExportCreateBookmarks 1 = wdExportCreateHeadingBookmarks (用標題建立書籤)
+        
+        doc.ExportAsFixedFormat(
+            OutputFileName=pdf_file,
+            ExportFormat=17,
+            OpenAfterExport=False,
+            OptimizeFor=0,  # wdExportOptimizeForPrint
+            CreateBookmarks=1  # wdExportCreateHeadingBookmarks
+        )
+        
+        doc.Close(SaveChanges=False)
+        word.Quit()
+        pythoncom.CoUninitialize()
+        
+        print(f"成功生成 PDF 檔案：{os.path.basename(pdf_file)}")
         print(f"檔案大小：{os.path.getsize(pdf_file) / 1024:.2f} KB")
         
         return True
@@ -429,6 +457,21 @@ def convert_docx_to_pdf(docx_file):
     except Exception as e:
         print(f"\n警告：轉換 PDF 時發生錯誤: {e}")
         traceback.print_exc()
+        
+        # 如果發生例外，嘗試釋放資源
+        try:
+            doc.Close(SaveChanges=False)
+        except:
+            pass
+        try:
+            word.Quit()
+        except:
+            pass
+        try:
+            pythoncom.CoUninitialize()
+        except:
+            pass
+            
         return False
 
 def convert_string_simplified_to_traditional(text):
