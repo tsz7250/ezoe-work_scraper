@@ -4,3 +4,4 @@ pypandoc>=1.16.0
 python-docx>=1.0.0
 docx2pdf>=0.1.8
 pywin32>=311
+bertcc==0.1.0

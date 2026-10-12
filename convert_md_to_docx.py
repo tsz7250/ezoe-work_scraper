@@ -9,17 +9,203 @@ import os
 import re
 import glob
 import sys
+import json
+import subprocess
 import traceback
 import pypandoc
 from docx import Document
 from docx.shared import Pt
 from docx2pdf import convert as docx2pdf_convert
+import torch
+import torch.nn.functional as F
+from bertcc.converter import ChineseConverter, ConversionConfig
+from bertcc.utils.constants import sc_dict, scp_set
 
-# Word WdTCSCConverterDirection 常數
-# SCTC = 0 = Simplified to Traditional Chinese（簡體→繁體）
-# TCSC = 1 = Traditional to Simplified Chinese（繁體→簡體）
-# Auto = 2 = 自動判斷
-WD_TCSC_CONVERTER_DIRECTION_SCTC = 0
+
+class ContextAwareChineseConverter(ChineseConverter):
+    """修正 BertCC 0.1.0 候選字評分錯誤。"""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.phrase_trie = {}
+        dictionary_path = os.path.join(
+            os.path.dirname(__file__), "data", "tongwen_s2t_phrase.min.json"
+        )
+        with open(dictionary_path, encoding="utf-8") as dictionary_file:
+            phrase_groups = json.load(dictionary_file)
+
+        for source, target in phrase_groups[0].items():
+            if len(source) != len(target):
+                continue
+            if not all(
+                source_char == target_char
+                or target_char in sc_dict.get(source_char, ())
+                for source_char, target_char in zip(source, target)
+            ):
+                continue
+
+            node = self.phrase_trie
+            for character in source:
+                node = node.setdefault(character, {})
+            node[None] = target
+
+    def convert(self, input_str, show_details=False):
+        if not input_str:
+            return ""
+
+        batches = self._split_into_batches(input_str)
+        converted_batches = []
+        confident_choices = {}
+        matches = []
+        index = 0
+        while index < len(input_str):
+            node = self.phrase_trie
+            cursor = index
+            match = None
+            while cursor < len(input_str) and input_str[cursor] in node:
+                node = node[input_str[cursor]]
+                cursor += 1
+                if None in node:
+                    match = (cursor, node[None])
+
+            if match:
+                end, target = match
+                matches.append((index, end, target))
+                index = end
+            else:
+                index += 1
+
+        half_overlap = self.config.overlap_size // 2
+        for batch_id, batch_text in enumerate(batches):
+            batch_start = batch_id * self.config.batch_size
+            if batch_id:
+                batch_start -= self.config.overlap_size
+            predictions, converted_text = self._process_batch(batch_text)
+            left_trim = half_overlap if batch_id else 0
+            right_trim = half_overlap if batch_id != len(batches) - 1 else 0
+            retained = converted_text[left_trim:len(converted_text) - right_trim or None]
+            converted_batches.append(retained)
+
+            prediction_index = 0
+            for local_index, character in enumerate(batch_text):
+                if len(sc_dict.get(character, ())) <= 1:
+                    continue
+                prediction = predictions[prediction_index]
+                prediction_index += 1
+                if left_trim <= local_index < len(batch_text) - right_trim:
+                    confident_choices[batch_start + local_index] = prediction[0]
+
+        converted = list("".join(converted_batches))
+        if len(converted) != len(input_str):
+            raise ValueError("BertCC 批次轉換未保留原文字數")
+
+        for start, end, target in matches:
+            for offset, target_char in enumerate(target):
+                position = start + offset
+                source_char = input_str[position]
+                selected = confident_choices.get(position)
+                # [reason] 高信心模型結果優先；詞典只補低信心的多義字判斷。
+                if (
+                    source_char != target_char
+                    and selected is not None
+                    and selected[1] >= 0.9
+                    and selected[0] != target_char
+                ):
+                    continue
+                converted[position] = target_char
+
+        return "".join(converted)
+
+    def _get_predictions(self, text, candidates_list, prefix_len):
+        results = []
+        inputs = self.tokenizer(text, return_tensors="pt")
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+        mask_positions = torch.where(
+            inputs["input_ids"][0] == self.tokenizer.mask_token_id
+        )[0]
+        if len(mask_positions) != len(candidates_list):
+            raise ValueError("BertCC 遮罩數量與候選字數量不符")
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            all_predictions = outputs.logits[0, mask_positions]
+
+        for index, candidates in enumerate(candidates_list):
+            if not candidates:
+                results.append([("[MASK]", 1.0)])
+                continue
+
+            traditional_candidates = candidates[1:]
+            candidate_ids = torch.tensor(
+                [
+                    self.tokenizer.encode(candidate, add_special_tokens=False)[0]
+                    for candidate in traditional_candidates
+                ],
+                device=self.device,
+            )
+            probabilities = F.softmax(
+                all_predictions[index][candidate_ids], dim=0
+            )
+            candidate_results = list(
+                zip(traditional_candidates, probabilities.cpu().tolist())
+            )
+            selected_index = int(probabilities.argmax().item())
+            inputs["input_ids"][:, mask_positions[index]] = candidate_ids[selected_index]
+
+            if (
+                index < len(mask_positions) - 1
+                and mask_positions[index].item() == mask_positions[index + 1].item() - 1
+            ):
+                key = candidates[0] + (
+                    "" if not candidates_list[index + 1]
+                    else candidates_list[index + 1][0]
+                )
+                if key in scp_set:
+                    with torch.no_grad():
+                        outputs = self.model(**inputs)
+                    all_predictions = outputs.logits[0, mask_positions]
+
+            candidate_results.sort(key=lambda item: item[1], reverse=True)
+            results.append(candidate_results)
+
+        if prefix_len:
+            text = text[prefix_len:]
+        converted = self._replace_matches(
+            text, r"\[MASK\]", [result[0][0] for result in results]
+        )
+        return results, converted
+
+
+def convert_markdown_text(content, converter):
+    """轉換 Markdown 文字區塊，保留標題標記與程式碼區塊。"""
+    output = []
+    block_lines = []
+    prefixes = []
+    in_code_block = False
+
+    def flush_text_block():
+        if not block_lines:
+            return
+        source = "\n".join(block_lines)
+        converted_lines = converter.convert(source).split("\n")
+        output.extend(prefix + line for prefix, line in zip(prefixes, converted_lines))
+        block_lines.clear()
+        prefixes.clear()
+
+    for line in content.split("\n"):
+        if line.lstrip().startswith("```"):
+            flush_text_block()
+            output.append(line)
+            in_code_block = not in_code_block
+        elif in_code_block:
+            output.append(line)
+        else:
+            heading = re.match(r"^(#{1,6}\s+)(.*)$", line)
+            prefixes.append(heading.group(1) if heading else "")
+            block_lines.append(heading.group(2) if heading else line)
+
+    flush_text_block()
+    return "\n".join(output)
 
 def get_article_number(filename):
     """從檔案名提取文章編號"""
@@ -365,6 +551,9 @@ def process_docx_headings(docx_file):
 
 def convert_to_docx(markdown_content, output_file):
     """使用 pypandoc 將 Markdown 轉換為 DOCX"""
+    temp_md = "temp_merged.md"
+    output_directory = os.path.dirname(os.path.abspath(output_file))
+    temp_docx = os.path.join(output_directory, "pandoc_output.docx")
     try:
         # 檢查 pandoc 是否已安裝
         try:
@@ -376,7 +565,6 @@ def convert_to_docx(markdown_content, output_file):
         print(f"\n開始轉換為 DOCX 格式...")
         
         # 先將內容寫入臨時 Markdown 檔案，避免編碼問題
-        temp_md = "temp_merged.md"
         with open(temp_md, 'w', encoding='utf-8') as f:
             f.write(markdown_content)
         
@@ -385,17 +573,31 @@ def convert_to_docx(markdown_content, output_file):
             '--standalone',  # 產生獨立的文件
         ]
         
-        # 執行轉換（從檔案轉換）
-        pypandoc.convert_file(
-            temp_md,
-            'docx',
-            outputfile=output_file,
-            extra_args=extra_args
-        )
-        
-        # 刪除臨時檔案
-        if os.path.exists(temp_md):
-            os.remove(temp_md)
+        try:
+            pypandoc.convert_file(
+                temp_md,
+                'docx',
+                outputfile=temp_docx,
+                extra_args=extra_args
+            )
+        except RuntimeError as error:
+            if 'Pandoc output was not utf-8' not in str(error):
+                raise
+
+            pandoc_path = pypandoc.get_pandoc_path()
+            result = subprocess.run(
+                [pandoc_path, '--from=markdown', '--to=docx', temp_md,
+                 '--output', temp_docx, '--standalone'],
+                capture_output=True,
+                check=False
+            )
+            if result.returncode != 0:
+                diagnostics = result.stderr.decode('utf-8', errors='replace').strip()
+                raise RuntimeError(
+                    f'Pandoc conversion failed (exit code {result.returncode}): {diagnostics}'
+                ) from error
+
+        os.replace(temp_docx, output_file)
         
         print(f"\n成功生成 DOCX 檔案：{output_file}")
         print(f"檔案大小：{os.path.getsize(output_file) / 1024:.2f} KB")
@@ -411,6 +613,10 @@ def convert_to_docx(markdown_content, output_file):
     except Exception as e:
         print(f"\n錯誤：轉換過程發生錯誤: {e}")
         return False
+    finally:
+        for temporary_file in (temp_md, temp_docx):
+            if os.path.exists(temporary_file):
+                os.remove(temporary_file)
 
 def convert_docx_to_pdf(docx_file):
     """將 DOCX 檔案轉換為 PDF，並確保產生書籤(目錄)"""
@@ -474,175 +680,6 @@ def convert_docx_to_pdf(docx_file):
             
         return False
 
-def convert_string_simplified_to_traditional(text):
-    """
-    使用 Word COM 將字串由簡體轉為繁體。
-    需在 Windows 上執行且已安裝 Microsoft Word。
-    回傳轉換後的字串；若失敗則回傳原字串。
-    增強版：包含重試機制、延遲和完善的資源清理。
-    """
-    if sys.platform != 'win32':
-        return text
-    
-    import time
-    
-    # 重試最多 3 次
-    for attempt in range(3):
-        app = None
-        doc = None
-        try:
-            import pythoncom
-            import win32com.client
-            
-            # 初始化 COM
-            pythoncom.CoInitialize()
-            
-            # 創建 Word 應用程序
-            app = win32com.client.Dispatch('Word.Application')
-            app.Visible = False
-            app.DisplayAlerts = 0  # 禁用所有警告彈窗
-            
-            # 創建新文檔
-            doc = app.Documents.Add()
-            doc.Content.Text = text
-            
-            # 執行簡轉繁
-            doc.Content.TCSCConverter(WD_TCSC_CONVERTER_DIRECTION_SCTC, True, True)
-            result = doc.Content.Text.strip()
-            
-            # 關閉文檔（不保存）
-            doc.Close(SaveChanges=False)
-            doc = None
-            
-            # 關閉 Word
-            app.Quit()
-            app = None
-            
-            # 清理 COM
-            pythoncom.CoUninitialize()
-            
-            return result
-            
-        except Exception as e:
-            print(f"警告：字串簡轉繁失敗 (嘗試 {attempt + 1}/3): {e}")
-            
-            # 清理資源
-            try:
-                if doc is not None:
-                    doc.Close(SaveChanges=False)
-            except:
-                pass
-            
-            try:
-                if app is not None:
-                    app.Quit()
-            except:
-                pass
-            
-            try:
-                pythoncom.CoUninitialize()
-            except:
-                pass
-            
-            # 如果不是最後一次嘗試，等待 1.5 秒後重試
-            if attempt < 2:
-                time.sleep(1.5)
-            else:
-                # 最後一次嘗試失敗，返回原字串
-                return text
-    
-    return text
-
-def convert_docx_simplified_to_traditional(docx_path):
-    """
-    使用 Word COM 將 DOCX 整份內容由簡體轉為繁體並存檔。
-    需在 Windows 上執行且已安裝 Microsoft Word。
-    回傳 True 成功，False 失敗。
-    增強版：包含重試機制、延遲和完善的資源清理。
-    """
-    if sys.platform != 'win32':
-        print("警告：簡轉繁需在 Windows 上使用 Word COM，已略過")
-        return False
-    
-    import time
-    
-    abs_path = os.path.abspath(docx_path)
-    if not os.path.isfile(abs_path):
-        print(f"警告：找不到檔案 {abs_path}")
-        return False
-    
-    # 重試最多 3 次
-    for attempt in range(3):
-        app = None
-        doc = None
-        try:
-            import pythoncom
-            import win32com.client
-            
-            # 初始化 COM
-            pythoncom.CoInitialize()
-            
-            # 創建 Word 應用程序
-            app = win32com.client.Dispatch('Word.Application')
-            app.Visible = False
-            app.DisplayAlerts = 0  # 禁用所有警告彈窗
-            
-            # 開啟文檔
-            doc = app.Documents.Open(FileName=abs_path, ConfirmConversions=False, ReadOnly=False)
-            doc.Activate()
-            
-            # 選取整份文件後再轉換
-            app.Selection.WholeStory()
-            app.Selection.Range.TCSCConverter(WD_TCSC_CONVERTER_DIRECTION_SCTC, True, True)
-            
-            # 保存並關閉
-            doc.Save()
-            doc.Close(SaveChanges=True)
-            doc = None
-            
-            # 關閉 Word
-            app.Quit()
-            app = None
-            
-            # 清理 COM
-            pythoncom.CoUninitialize()
-            
-            print("已使用 Word 將整份文件轉為繁體並存檔")
-            return True
-            
-        except Exception as e:
-            print(f"\n警告：Word 簡轉繁時發生錯誤 (嘗試 {attempt + 1}/3): {e}")
-            if attempt < 2:
-                print(f"將在 1.5 秒後重試...")
-            
-            # 清理資源
-            try:
-                if doc is not None:
-                    doc.Close(SaveChanges=False)
-            except:
-                pass
-            
-            try:
-                if app is not None:
-                    app.Quit()
-            except:
-                pass
-            
-            try:
-                pythoncom.CoUninitialize()
-            except:
-                pass
-            
-            # 如果不是最後一次嘗試，等待 1.5 秒後重試
-            if attempt < 2:
-                time.sleep(1.5)
-            else:
-                # 最後一次嘗試失敗
-                traceback.print_exc()
-                return False
-    
-    return False
-
 def main():
     """主程式"""
     print("=" * 60)
@@ -655,6 +692,13 @@ def main():
     
     if not books:
         print("錯誤：未找到任何符合 書名_數字.md 格式的 Markdown 檔案")
+        return 1
+
+    try:
+        print("載入上下文式簡轉繁模型...")
+        context_converter = ContextAwareChineseConverter(ConversionConfig())
+    except Exception as e:
+        print(f"錯誤：無法載入簡轉繁模型：{e}")
         return 1
     
     print(f"\n找到 {len(books)} 本書，共 {sum(len(files) for files in books.values())} 個檔案：")
@@ -684,31 +728,21 @@ def main():
         
         print(f"合併完成，總字數：{len(merged_content)} 字元")
         
+        try:
+            merged_content = convert_markdown_text(merged_content, context_converter)
+            traditional_book_name = context_converter.convert(book_name)
+        except Exception as e:
+            print(f"錯誤：簡轉繁失敗：{e}")
+            fail_count += 1
+            continue
+
         # 轉換為 DOCX
-        print(f"步驟 3: 轉換為 DOCX 格式...")
-        output_file = f"{book_name.replace('_', ' ')}.docx"
+        print("步驟 3: 轉換為 DOCX 格式...")
+        output_file = f"{traditional_book_name.replace('_', ' ')}.docx"
         
         if convert_to_docx(merged_content, output_file):
-            # 使用 Word COM 將 DOCX 簡體轉繁體並存檔
-            print(f"步驟 4: 使用 Word 將 DOCX 簡體轉繁體...")
-            convert_docx_simplified_to_traditional(output_file)
-            
-            # 將書名轉為繁體並重新命名檔案
-            print(f"步驟 5: 將檔案名稱轉為繁體...")
-            traditional_book_name = convert_string_simplified_to_traditional(book_name)
-            if traditional_book_name != book_name:
-                new_output_file = f"{traditional_book_name.replace('_', ' ')}.docx"
-                try:
-                    if os.path.exists(new_output_file):
-                        os.remove(new_output_file)
-                    os.rename(output_file, new_output_file)
-                    output_file = new_output_file
-                    print(f"已將檔案重新命名為：{output_file}")
-                except Exception as e:
-                    print(f"警告：重新命名失敗: {e}")
-            
             # PDF 由已轉繁的 .docx 產生
-            print(f"步驟 6: 轉換為 PDF 格式...")
+            print("步驟 4: 轉換為 PDF 格式...")
             convert_docx_to_pdf(output_file)  # PDF 轉換失敗不影響整體成功狀態
             success_count += 1
         else:
