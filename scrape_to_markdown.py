@@ -62,6 +62,36 @@ def convert_quotes(text):
             result.append(char)
     return ''.join(result)
 
+def format_heading_title(element):
+    title_text = fullwidth_to_halfwidth(element.get_text(strip=True))
+    title_text = re.sub(
+        r'^([零〇一二三四五六七八九十百千壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+)(?=[^\s、，,。；;：:])',
+        r'\1　',
+        title_text,
+        count=1
+    )
+    return title_text
+
+def extract_content_text(container):
+    for modal in container.find_all('div', class_='modal'):
+        modal.decompose()
+
+    for a_tag in container.find_all('a'):
+        a_tag.replace_with(a_tag.get_text())
+
+    ordinal_pattern = re.compile(r'[零〇一二三四五六七八九十百千壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+')
+    for l2 in container.find_all('div', class_='l2'):
+        columns = l2.find_all('div', recursive=False)
+        if len(columns) != 2:
+            continue
+
+        ordinal = re.sub(r'[ \t\r\n\f\v]+', ' ', columns[0].get_text()).strip()
+        body = re.sub(r'[ \t\r\n\f\v]+', ' ', columns[1].get_text()).strip()
+        if ordinal_pattern.fullmatch(ordinal) and body:
+            l2.replace_with(NavigableString(f'{ordinal}　{body}'))
+
+    return container.get_text(strip=True)
+
 def extract_book_name(soup, url=None):
     """
     從網頁中提取書名
@@ -209,22 +239,22 @@ def scrape_to_markdown(url, output_file=None):
     for element in main.find_all(recursive=False):
         # 處理 cn1 層級標題（二級標題）
         if element.get('class') and 'cn1' in element.get('class'):
-            title_text = fullwidth_to_halfwidth(element.get_text(strip=True))
+            title_text = format_heading_title(element)
             markdown_lines.append(f"\n## {title_text}\n")
         
         # 處理 cn2 層級標題（三級標題）
         elif element.get('class') and 'cn2' in element.get('class'):
-            title_text = fullwidth_to_halfwidth(element.get_text(strip=True))
+            title_text = format_heading_title(element)
             markdown_lines.append(f"\n### {title_text}\n")
         
         # 處理 cn3 層級標題（四級標題）
         elif element.get('class') and 'cn3' in element.get('class'):
-            title_text = fullwidth_to_halfwidth(element.get_text(strip=True))
+            title_text = format_heading_title(element)
             markdown_lines.append(f"\n#### {title_text}\n")
         
         # 處理 cn4 層級標題（五級標題）
         elif element.get('class') and 'cn4' in element.get('class'):
-            title_text = fullwidth_to_halfwidth(element.get_text(strip=True))
+            title_text = format_heading_title(element)
             markdown_lines.append(f"\n##### {title_text}\n")
         
         # 處理內容區域（id='c' 的 div）
@@ -235,30 +265,11 @@ def scrape_to_markdown(url, output_file=None):
             if cont_divs:
                 # 如果有 cont 子元素，處理每個 cont
                 for cont in cont_divs:
-                    # 先移除所有 modal div 元素
-                    for modal in cont.find_all('div', class_='modal'):
-                        modal.decompose()
-                    
-                    # 將 <a> 標籤替換為其文字內容（保留顯示的文字，移除超連結）
-                    for a_tag in cont.find_all('a'):
-                        a_tag.replace_with(a_tag.get_text())
-                    
-                    # 獲取純文字內容
-                    text = cont.get_text(strip=True)
+                    text = extract_content_text(cont)
                     if text:
                         markdown_lines.append(f"\n{text}\n")
             else:
-                # 如果沒有 cont 子元素，直接提取 id='c' 元素的內容
-                # 先移除所有 modal div 元素
-                for modal in element.find_all('div', class_='modal'):
-                    modal.decompose()
-                
-                # 將 <a> 標籤替換為其文字內容
-                for a_tag in element.find_all('a'):
-                    a_tag.replace_with(a_tag.get_text())
-                
-                # 獲取純文字內容
-                text = element.get_text(strip=True)
+                text = extract_content_text(element)
                 if text:
                     markdown_lines.append(f"\n{text}\n")
     
